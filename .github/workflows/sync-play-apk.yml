@@ -1,0 +1,88 @@
+# 从 Google Play 同步最新签名通用 APK 到 GitHub Releases
+#
+# 对外固定下载链接（永远指向最新版）：
+#   https://github.com/<owner>/<repo>/releases/latest/download/app-release.apk
+#
+# 需要配置的 GitHub Secrets：
+#   PLAY_SERVICE_ACCOUNT_JSON  - Google Play 服务账号 JSON 密钥全文
+#   PACKAGE_NAME               - 应用包名，如 com.example.myapp
+#
+# 触发方式：
+#   - 每天定时检查一次（cron，UTC 时间）
+#   - 手动触发（Actions 页面 workflow_dispatch）
+
+name: Sync Play Signed Universal APK
+
+on:
+  schedule:
+    - cron: "0 2 * * *"   # 每天 UTC 02:00（北京时间 10:00）
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 用于创建/更新 Release
+
+jobs:
+  sync-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Ruby & fastlane
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2"
+          bundler-cache: false
+      - run: gem install fastlane --no-document
+
+      - name: 记录同步前的 APK 指纹（用于判断是否有新版本）
+        id: before
+        run: |
+          if gh release view latest-apk --json tagName >/dev/null 2>&1; then
+            gh release download latest-apk -p app-release.apk -O app-release-old.apk --clobber || true
+          fi
+          if [ -f app-release-old.apk ]; then
+            echo "old_sha=$(sha256sum app-release-old.apk | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          else
+            echo "old_sha=none" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 从 Google Play 下载最新签名通用 APK
+        run: fastlane android download_latest_universal_apk
+        env:
+          PACKAGE_NAME: ${{ secrets.PACKAGE_NAME || 'com.tcl.browser' }}
+          PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+
+      - name: 对比指纹，无变化则跳过上传
+        id: diff
+        run: |
+          new_sha=$(sha256sum app-release.apk | cut -d' ' -f1)
+          echo "new_sha=$new_sha" >> "$GITHUB_OUTPUT"
+          echo "changed=$([ "$new_sha" != "${{ steps.before.outputs.old_sha }}" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: 获取版本信息（用于 Release 备注）
+        id: ver
+        run: |
+          # 从 APK 中解析 versionName（需要 aapt）
+          sudo apt-get install -y aapt >/dev/null 2>&1 || true
+          VER=$(aapt dump badging app-release.apk 2>/dev/null | sed -n "s/.*versionName='\([^']*\)'.*/\1/p")
+          VC=$(aapt dump badging app-release.apk 2>/dev/null | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p")
+          echo "version_name=${VER:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "version_code=${VC:-unknown}" >> "$GITHUB_OUTPUT"
+
+      - name: 更新 latest-apk Release（覆盖上传，链接不变）
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          gh release delete latest-apk --yes --cleanup-tag=false 2>/dev/null || true
+          gh release create latest-apk app-release.apk \
+            --title "Latest APK - v${{ steps.ver.outputs.version_name }} (${{ steps.ver.outputs.version_code }})" \
+            --notes "自动同步自 Google Play 生产版本
+          versionCode: ${{ steps.ver.outputs.version_code }}
+          SHA256: ${{ steps.diff.outputs.new_sha }}
+          同步时间: $(date -u '+%Y-%m-%d %H:%M UTC')
+
+          固定下载地址：releases/latest/download/app-release.apk"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
