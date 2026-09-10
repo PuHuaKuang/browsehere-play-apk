@@ -1,15 +1,19 @@
 # 从 Google Play 同步最新签名通用 APK 到 GitHub Releases
 #
 # 对外固定下载链接（永远指向最新版）：
-#   https://github.com/<owner>/<repo>/releases/latest/download/app-release.apk
+#   https://github.com/PuHuaKuang/browsehere-play-apk/releases/latest/download/app-release.apk
 #
-# 需要配置的 GitHub Secrets：
-#   PLAY_SERVICE_ACCOUNT_JSON  - Google Play 服务账号 JSON 密钥全文
-#   PACKAGE_NAME               - 应用包名，如 com.example.myapp
+# Secrets：
+#   PLAY_SERVICE_ACCOUNT_JSON  - Google Play 服务账号 JSON 密钥全文（必需）
+# Variables：
+#   PLAY_SIGNING_CERT_SHA256   - Play Console「应用完整性」中的应用签名证书 SHA-256 指纹
+#                                （可选；配置后校验签名指纹，不符即拒绝发布）
 #
-# 触发方式：
-#   - 每天定时检查一次（cron，UTC 时间）
-#   - 手动触发（Actions 页面 workflow_dispatch）
+# 校验链（任一失败即中止，旧 Release 保持不变）：
+#   1. 完整性   - aapt 能解析包结构
+#   2. 正式包   - 包名必须等于 com.tcl.browser
+#   3. 官方签名 - apksigner 验签通过，且证书指纹与 Play App Signing 一致
+#   4. 防回退   - versionCode 不得小于当前线上版本
 
 name: Sync Play Signed Universal APK
 
@@ -19,7 +23,10 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # 用于创建/更新 Release
+  contents: write
+
+env:
+  EXPECT_PACKAGE: com.tcl.browser
 
 jobs:
   sync-apk:
@@ -32,15 +39,15 @@ jobs:
         uses: ruby/setup-ruby@v1
         with:
           ruby-version: "3.2"
-          bundler-cache: false
       - run: gem install fastlane --no-document
 
-      - name: 记录同步前的 APK 指纹（用于判断是否有新版本）
+      - name: 安装校验工具（aapt / apksigner）
+        run: sudo apt-get update -qq && sudo apt-get install -y aapt apksigner
+
+      - name: 下载当前线上旧 APK（用于指纹与版本对比）
         id: before
         run: |
-          if gh release view latest-apk --json tagName >/dev/null 2>&1; then
-            gh release download latest-apk -p app-release.apk -O app-release-old.apk --clobber || true
-          fi
+          gh release download latest-apk -p app-release.apk -O app-release-old.apk --clobber 2>/dev/null || true
           if [ -f app-release-old.apk ]; then
             echo "old_sha=$(sha256sum app-release-old.apk | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
           else
@@ -55,32 +62,67 @@ jobs:
           PACKAGE_NAME: ${{ secrets.PACKAGE_NAME || 'com.tcl.browser' }}
           PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
 
-      - name: 对比指纹，无变化则跳过上传
-        id: diff
+      - name: 校验 APK（完整性 / 包名 / 签名 / 版本）
+        id: verify
         run: |
-          new_sha=$(sha256sum app-release.apk | cut -d' ' -f1)
-          echo "new_sha=$new_sha" >> "$GITHUB_OUTPUT"
-          echo "changed=$([ "$new_sha" != "${{ steps.before.outputs.old_sha }}" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          set -e
 
-      - name: 获取版本信息（用于 Release 备注）
-        id: ver
-        run: |
-          # 从 APK 中解析 versionName（需要 aapt）
-          sudo apt-get install -y aapt >/dev/null 2>&1 || true
-          VER=$(aapt dump badging app-release.apk 2>/dev/null | sed -n "s/.*versionName='\([^']*\)'.*/\1/p")
-          VC=$(aapt dump badging app-release.apk 2>/dev/null | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p")
-          echo "version_name=${VER:-unknown}" >> "$GITHUB_OUTPUT"
-          echo "version_code=${VC:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "=== 1. 完整性校验（aapt 解析） ==="
+          BADGING=$(aapt dump badging app-release.apk) || { echo "::error::APK 结构损坏，aapt 无法解析"; exit 1; }
+          PKG=$(echo "$BADGING" | sed -n "s/^package: name='\([^']*\)'.*/\1/p")
+          VC=$(echo "$BADGING"  | sed -n "s/^package: .*versionCode='\([0-9]*\)'.*/\1/p")
+          VN=$(echo "$BADGING"  | sed -n "s/^package: .*versionName='\([^']*\)'.*/\1/p")
+          echo "包名=$PKG  versionCode=$VC  versionName=$VN"
+          [ -n "$VC" ] || { echo "::error::无法解析 versionCode"; exit 1; }
+
+          echo "=== 2. 正式包校验（包名） ==="
+          if [ "$PKG" != "$EXPECT_PACKAGE" ]; then
+            echo "::error::包名不符！期望 $EXPECT_PACKAGE，实际 $PKG"; exit 1;
+          fi
+
+          echo "=== 3. 签名校验（apksigner 验签 + 证书指纹） ==="
+          apksigner verify app-release.apk || { echo "::error::apksigner 验签失败"; exit 1; }
+          CERT=$(apksigner verify --print-certs app-release.apk | sed -n "s/Signer #1 certificate SHA-256 digest: //p")
+          echo "签名证书 SHA-256: $CERT"
+          EXPECT_CERT="${{ vars.PLAY_SIGNING_CERT_SHA256 }}"
+          if [ -n "$EXPECT_CERT" ]; then
+            if [ "$CERT" != "$EXPECT_CERT" ]; then
+              echo "::error::签名证书指纹不符，非正式包！期望 $EXPECT_CERT，实际 $CERT"; exit 1;
+            fi
+            echo "证书指纹匹配 Play App Signing ✓"
+          else
+            echo "::warning::未配置 PLAY_SIGNING_CERT_SHA256，跳过证书指纹比对（建议配置）"
+          fi
+
+          echo "=== 4. 版本对比（防回退 + 变更检测） ==="
+          NEW_SHA=$(sha256sum app-release.apk | cut -d' ' -f1)
+          CHANGED=true
+          if [ -f app-release-old.apk ]; then
+            OLD_VC=$(aapt dump badging app-release-old.apk | sed -n "s/^package: .*versionCode='\([0-9]*\)'.*/\1/p")
+            echo "线上 versionCode=$OLD_VC -> 新版 versionCode=$VC"
+            if [ -n "$OLD_VC" ] && [ "$VC" -lt "$OLD_VC" ]; then
+              echo "::error::版本回退！线上 $OLD_VC，新版 $VC，拒绝发布"; exit 1;
+            fi
+            if [ "$NEW_SHA" = "${{ steps.before.outputs.old_sha }}" ]; then
+              CHANGED=false
+              echo "APK 指纹与线上一致，无新版本，跳过 Release 更新"
+            fi
+          fi
+
+          echo "version_name=$VN" >> "$GITHUB_OUTPUT"
+          echo "version_code=$VC" >> "$GITHUB_OUTPUT"
+          echo "new_sha=$NEW_SHA"   >> "$GITHUB_OUTPUT"
+          echo "changed=$CHANGED"   >> "$GITHUB_OUTPUT"
 
       - name: 更新 latest-apk Release（覆盖上传，链接不变）
-        if: steps.diff.outputs.changed == 'true'
+        if: steps.verify.outputs.changed == 'true'
         run: |
           gh release delete latest-apk --yes --cleanup-tag=false 2>/dev/null || true
           gh release create latest-apk app-release.apk \
-            --title "Latest APK - v${{ steps.ver.outputs.version_name }} (${{ steps.ver.outputs.version_code }})" \
-            --notes "自动同步自 Google Play 生产版本
-          versionCode: ${{ steps.ver.outputs.version_code }}
-          SHA256: ${{ steps.diff.outputs.new_sha }}
+            --title "Latest APK - v${{ steps.verify.outputs.version_name }} (${{ steps.verify.outputs.version_code }})" \
+            --notes "自动同步自 Google Play 生产版本（已通过完整性/包名/签名/版本校验）
+          versionCode: ${{ steps.verify.outputs.version_code }}
+          SHA256: ${{ steps.verify.outputs.new_sha }}
           同步时间: $(date -u '+%Y-%m-%d %H:%M UTC')
 
           固定下载地址：releases/latest/download/app-release.apk"
