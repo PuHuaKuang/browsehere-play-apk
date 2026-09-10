@@ -1,0 +1,37 @@
+# Fastfile - 从 Google Play 下载最新生产版本的签名通用 APK
+#
+# 一次性准备：
+#   1. Google Cloud Console 创建服务账号，启用 "Google Play Android Developer API"
+#   2. 下载服务账号 JSON 密钥
+#   3. Play Console -> 用户和权限 -> 邀请该服务账号邮箱，
+#      授予「查看应用信息和下载批量报告」+「管理版本」相关权限
+#      （至少需要：查看应用信息、发布应用到轨道）
+
+default_platform(:android)
+
+platform :android do
+  desc "下载最新生产版本的 Signed Universal APK"
+  lane :download_latest_universal_apk do
+    package_name = ENV["PACKAGE_NAME"] || "com.tcl.browser"
+    json_key_data = ENV["PLAY_SERVICE_ACCOUNT_JSON"] || UI.user_error!("缺少 PLAY_SERVICE_ACCOUNT_JSON")
+
+    # 1. 通过 supply 的能力查询 production 轨道最新 versionCode
+    version_code = google_play_track_version_codes(
+      package_name: package_name,
+      track: "production",
+      json_key_data: json_key_data
+    ).max
+
+    UI.message("最新生产版本 versionCode: #{version_code}")
+
+    # 2. 下载该版本的签名通用 APK（内部调用 generatedapks API，含重试轮询）
+    download_universal_apk_from_google_play(
+      package_name: package_name,
+      version_code: version_code,
+      json_key_data: json_key_data,
+      destination: "app-release.apk"
+    )
+
+    UI.success("已下载 app-release.apk (versionCode: #{version_code})")
+  end
+end
